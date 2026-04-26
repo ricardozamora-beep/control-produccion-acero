@@ -14,22 +14,24 @@ def calcular_programa_maestro(fecha_inicio, lista_pedidos, paradas_manto, feriad
         setup_min = pedido['setup']
         
         # 1. Bloque de Set-up
-        inicio_setup = momento_actual
-        momento_actual += timedelta(minutes=setup_min)
-        programa.append({
-            "Actividad": f"SET-UP: {producto}",
-            "Inicio": inicio_setup, "Fin": momento_actual,
-            "Detalle": f"Preparación de línea ({setup_min} min)"
-        })
+        if setup_min > 0:
+            inicio_setup = momento_actual
+            momento_actual += timedelta(minutes=setup_min)
+            programa.append({
+                "Actividad": f"SET-UP: {producto}",
+                "Inicio": inicio_setup, 
+                "Fin": momento_actual,
+                "Detalle": f"Preparación de línea ({setup_min} min)"
+            })
 
         # 2. Bloque de Producción con Saltos de Paradas
         kg_pendientes = tonelaje
         tasa_minuto = tasa_h / 60
         
         while kg_pendientes > 0:
-            # ¿Estamos en un día feriado? (Salto al siguiente día laboral a las 06:00)
+            # ¿Estamos en un día feriado?
             if momento_actual.date() in feriados:
-                momento_actual = (momento_actual + timedelta(days=1)).replace(hour=6, minute=0)
+                momento_actual = (momento_actual + timedelta(days=1)).replace(hour=6, minute=0, second=0)
                 continue
             
             # ¿Estamos en una ventana de mantenimiento?
@@ -50,9 +52,14 @@ def calcular_programa_maestro(fecha_inicio, lista_pedidos, paradas_manto, feriad
             momento_actual += timedelta(minutes=tiempo_bloque)
             kg_pendientes -= producido
 
-            # Agrupar registros de producción para el reporte
-            if not programa or programa[-1]['Actividad'] != f"PROD: {producto}":
-                programa.append({"Actividad": f"PROD: {producto}", "Inicio": inicio_p, "Fin": momento_actual, "Detalle": f"Carga: {tonelaje} kg"})
+            # Agrupar registros de producción para que el reporte no sea infinito
+            if not programa or programa[-1]['Actividad'] != f"PROD: {producto}" or programa[-1]['Fin'] < inicio_p:
+                programa.append({
+                    "Actividad": f"PROD: {producto}", 
+                    "Inicio": inicio_p, 
+                    "Fin": momento_actual, 
+                    "Detalle": f"Carga total: {tonelaje} kg"
+                })
             else:
                 programa[-1]['Fin'] = momento_actual
 
@@ -62,43 +69,97 @@ def calcular_programa_maestro(fecha_inicio, lista_pedidos, paradas_manto, feriad
 st.set_page_config(page_title="Rebar Master Scheduler", layout="wide")
 st.title("🏭 Programador Maestro de Producción 2.0")
 
-# 1. Carga de Catálogo
+# 1. Carga de Catálogo en Sidebar
 with st.sidebar:
     st.header("📂 Datos Maestros")
     archivo_cat = st.file_uploader("Cargar catálogo (Excel)", type=['xlsx'])
     
-    # Gestión de Mantenimientos Múltiples
     st.divider()
     st.subheader("🛠️ Paradas de Mantenimiento")
-    if 'mantenimientos' not in st.session_state: st.session_state.mantenimientos = []
+    if 'mantenimientos' not in st.session_state: 
+        st.session_state.mantenimientos = []
     
     with st.form("manto_form", clear_on_submit=True):
-        f_manto = st.date_input("Día")
-        h_ini = st.time_input("Inicio")
-        h_fin = st.time_input("Fin")
+        f_manto = st.date_input("Día del mantenimiento", datetime.now())
+        h_ini = st.time_input("Hora Inicio", datetime.strptime("08:00", "%H:%M").time())
+        h_fin = st.time_input("Hora Final", datetime.strptime("12:00", "%H:%M").time())
         if st.form_submit_button("Añadir Parada"):
-            st.session_state.mantenimientos.append((datetime.combine(f_manto, h_ini), datetime.combine(f_manto, h_fin)))
+            st.session_state.mantenimientos.append((
+                datetime.combine(f_manto, h_ini), 
+                datetime.combine(f_manto, h_fin)
+            ))
     
-    for i, (ini, fin) in enumerate(st.session_state.mantenimientos):
-        st.caption(f"{i+1}. {ini.strftime('%d/%m %H:%M')} a {fin.strftime('%H:%M')}")
-    if st.button("Limpiar Mantenimientos"): st.session_state.mantenimientos = []; st.rerun()
+    if st.session_state.mantenimientos:
+        for i, (ini, fin) in enumerate(st.session_state.mantenimientos):
+            st.caption(f"{i+1}. {ini.strftime('%d/%m %H:%M')} a {fin.strftime('%H:%M')}")
+        if st.button("Limpiar Mantenimientos"):
+            st.session_state.mantenimientos = []
+            st.rerun()
 
 # 2. Configuración de la Corrida
 if archivo_cat:
-    df_cat = pd.read_excel(archivo_cat)
-    productos_disponibles = df_cat['Nombre'].tolist()
-    
-    col1, col2, col3 = st.columns([1,1,2])
-    with col1: f_arranque = st.date_input("Fecha Inicio Real", datetime.now())
-    with col2: h_arranque = st.time_input("Hora Inicio Real", datetime.strptime("22:00", "%H:%M").time())
-    with col3: feriados = st.multiselect("Días Libres/Feriados", pd.date_range(datetime.now(), periods=60).date)
+    try:
+        df_cat = pd.read_excel(archivo_cat)
+        # Asegúrate de que tu Excel tenga estas columnas exactamente
+        productos_disponibles = df_cat['Nombre'].tolist()
+        
+        col1, col2, col3 = st.columns([1,1,2])
+        with col1: 
+            f_arranque = st.date_input("Fecha Inicio Real", datetime.now())
+        with col2: 
+            h_arranque = st.time_input("Hora Inicio Real", datetime.strptime("22:00", "%H:%M").time())
+        with col3: 
+            feriados = st.multiselect("Días Libres/Feriados", pd.date_range(datetime.now(), periods=60).date)
 
-    st.divider()
-    
-    # 3. Selección de Productos
-    st.subheader("📝 Plan de Carga")
-    if 'cola' not in st.session_state: st.session_state.cola = []
-    
-    with st.expander("Agregar producto al plan"):
-        c1, c2, c3 = st.columns(3)
-        p_sel = c1.selectbox("Seleccionar
+        st.divider()
+        
+        # 3. Selección de Productos
+        st.subheader("📝 Plan de Carga")
+        if 'cola' not in st.session_state: 
+            st.session_state.cola = []
+        
+        with st.expander("Agregar producto al plan", expanded=True):
+            c1, c2, c3 = st.columns(3)
+            p_sel = c1.selectbox("Seleccionar Producto", productos_disponibles)
+            p_ton = c2.number_input("Tonelaje Total (kg)", step=500, value=1000)
+            p_setup = c3.number_input("Set-up requerido (min)", value=30)
+            
+            if st.button("Añadir a Secuencia"):
+                tasa = df_cat[df_cat['Nombre'] == p_sel]['Tasa_kg_h'].values[0]
+                st.session_state.cola.append({
+                    'nombre': p_sel, 
+                    'tonelaje': p_ton, 
+                    'tasa_h': tasa, 
+                    'setup': p_setup
+                })
+
+        if st.session_state.cola:
+            st.write("Secuencia actual:")
+            st.table(pd.DataFrame(st.session_state.cola))
+            
+            col_bt1, col_bt2 = st.columns(2)
+            with col_bt1:
+                if st.button("🚀 GENERAR PROGRAMA"):
+                    dt_inicio = datetime.combine(f_arranque, h_arranque)
+                    df_final = calcular_programa_maestro(
+                        dt_inicio, 
+                        st.session_state.cola, 
+                        st.session_state.mantenimientos, 
+                        feriados
+                    )
+                    
+                    st.success("Calendario calculado exitosamente.")
+                    # Formatear fechas para el reporte
+                    df_reporte = df_final.copy()
+                    df_reporte['Inicio'] = df_reporte['Inicio'].dt.strftime('%d/%m/%Y %H:%M')
+                    df_reporte['Fin'] = df_reporte['Fin'].dt.strftime('%d/%m/%Y %H:%M')
+                    st.dataframe(df_reporte, use_container_width=True)
+            
+            with col_bt2:
+                if st.button("🗑️ Limpiar Cola"):
+                    st.session_state.cola = []
+                    st.rerun()
+    except Exception as e:
+        st.error(f"Error al leer el catálogo: {e}. Revisa que las columnas sean 'Nombre' y 'Tasa_kg_h'.")
+else:
+    st.info("Por favor, cargue el archivo del catálogo para comenzar.")
