@@ -2,85 +2,126 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 
-def generar_calendario_turnos(fecha_inicio, total_kg, capacidad_por_hora=500):
-    """
-    Calcula la distribución de carga en 3 turnos de 8h.
-    Turno 3 (Noche): 22:00 - 06:00 (Inicia el domingo)
-    Turno 1 (Mañana): 06:00 - 14:00
-    Turno 2 (Tarde): 14:00 - 22:00
-    """
-    horas_necesarias = total_kg / capacidad_por_hora
-    lineas_programa = []
+def generar_programa_detallado(fecha_inicio, hora_inicio, lista_productos, tiempo_cambio, paradas, mantenimientos):
+    programa = []
+    # Combinar fecha y hora de inicio
+    momento_actual = datetime.combine(fecha_inicio, hora_inicio)
     
-    # El ciclo inicia el domingo a las 22:00
-    momento_actual = datetime.combine(fecha_inicio, datetime.min.time()) + timedelta(hours=22)
-    horas_restantes = horas_necesarias
-    
-    while horas_restantes > 0:
-        hora = momento_actual.hour
+    for prod in lista_productos:
+        nombre = prod['nombre']
+        tonelaje = prod['tonelaje']
+        capacidad = prod['capacidad'] # kg/h
         
-        # Identificación de turnos
-        if 6 <= hora < 14:
-            nombre_turno = "Turno 1 (Mañana)"
-        elif 14 <= hora < 22:
-            nombre_turno = "Turno 2 (Tarde)"
-        else:
-            nombre_turno = "Turno 3 (Noche)"
+        # 1. Aplicar Tiempo de Cambio (Set-up)
+        if tiempo_cambio > 0:
+            programa.append({
+                "Fecha": momento_actual.strftime("%d/%m/%Y"),
+                "Turno": calcular_nombre_turno(momento_actual),
+                "Actividad": f"SET-UP: {nombre}",
+                "Detalle": f"Cambio de formato ({tiempo_cambio} min)",
+                "Inicio": momento_actual.strftime("%H:%M"),
+            })
+            momento_actual += timedelta(minutes=tiempo_cambio)
+
+        # 2. Calcular producción
+        horas_necesarias = tonelaje / capacidad
+        horas_restantes = horas_necesarias
+        
+        while horas_restantes > 0:
+            # Verificar si el momento actual cae en una PARADA o MANTENIMIENTO
+            dia_actual = momento_actual.date()
             
-        # Cálculo de horas por bloque
-        horas_en_este_turno = min(8, horas_restantes)
-        
-        lineas_programa.append({
-            "Fecha": momento_actual.strftime("%d/%m/%Y"),
-            "Turno": nombre_turno,
-            "Producción Planificada (kg)": int(horas_en_este_turno * capacidad_por_hora),
-            "Hora Inicio": momento_actual.strftime("%H:%M"),
-        })
-        
-        horas_restantes -= horas_en_este_turno
-        momento_actual += timedelta(hours=8)
-        
-    return pd.DataFrame(lineas_programa)
+            # Si es día libre
+            if dia_actual in paradas:
+                momento_actual = datetime.combine(dia_actual + timedelta(days=1), datetime.min.time() + timedelta(hours=6))
+                continue
+            
+            # Si hay mantenimiento programado (simplificado a bloque de horas)
+            # Aquí podrías añadir lógica más específica de horas de mantenimiento
+            
+            # Definir bloque de turno actual
+            nombre_turno = calcular_nombre_turno(momento_actual)
+            horas_hasta_fin_turno = calcular_horas_fin_turno(momento_actual)
+            
+            tiempo_a_producir = min(horas_restantes, horas_hasta_fin_turno)
+            
+            programa.append({
+                "Fecha": momento_actual.strftime("%d/%m/%Y"),
+                "Turno": nombre_turno,
+                "Actividad": f"PRODUCCIÓN: {nombre}",
+                "Detalle": f"{int(tiempo_a_producir * capacidad)} kg",
+                "Inicio": momento_actual.strftime("%H:%M"),
+            })
+            
+            horas_restantes -= tiempo_a_producir
+            momento_actual += timedelta(hours=tiempo_a_producir)
 
-# --- INTERFAZ DE STREAMLIT ---
-st.set_page_config(page_title="Programador Planta de Barras", layout="wide")
-st.title("🏭 Programación de Producción - Planta de Barras")
+    return pd.DataFrame(programa)
 
-# 1. Carga de Catálogo
-archivo_catalogo = st.file_uploader("1. Subir archivo de Catálogo", type=['csv', 'xlsx'])
+def calcular_nombre_turno(dt):
+    hora = dt.hour
+    if 6 <= hora < 14: return "Turno 1 (Mañana)"
+    elif 14 <= hora < 22: return "Turno 2 (Tarde)"
+    else: return "Turno 3 (Noche)"
 
-if archivo_catalogo:
-    st.success("Catálogo cargado.")
+def calcular_horas_fin_turno(dt):
+    hora = dt.hour
+    if 6 <= hora < 14: limite = 14
+    elif 14 <= hora < 22: limite = 22
+    else: limite = 6 if hora < 6 else 30 # Caso especial trasnoche
     
-    # 2. Selección de Fecha (Habilitada tras catálogo)
-    col1, col2 = st.columns(2)
+    prox_cambio = dt.replace(hour=limite % 24, minute=0, second=0)
+    if limite >= 24 or (limite == 6 and hora >= 22):
+        prox_cambio += timedelta(days=1)
     
-    with col1:
-        fecha_inicio = st.date_input("2. Fecha de inicio (Domingo)", datetime.now())
+    return (prox_cambio - dt).total_seconds() / 3600
+
+# --- INTERFAZ STREAMLIT ---
+st.set_page_config(layout="wide")
+st.title("⚙️ Programador de Planta Avanzado")
+
+# Sidebar para Configuración Global
+with st.sidebar:
+    st.header("Configuración de Planta")
+    tiempo_cambio = st.number_input("Tiempo de cambio entre productos (min)", value=30, step=15)
     
-    with col2:
-        # Ajuste de cantidad con paso de 500kg
-        cantidad_kg = st.number_input(
-            "3. Cantidad Total a Producir (kg)", 
-            min_value=0, 
-            value=1000, 
-            step=500
-        )
+    st.subheader("Días Libres / Feriados")
+    dias_libres = st.multiselect("Seleccione días que no se trabaja", 
+                                 pd.date_range(start=datetime.now(), periods=30),
+                                 format_func=lambda x: x.strftime("%d/%m"))
+    
+    st.subheader("Mantenimiento Programado")
+    fecha_manto = st.date_input("Día de mantenimiento")
+    horas_manto = st.slider("Duración mantenimiento (horas)", 1, 24, 4)
 
-    st.divider()
+# Cuerpo Principal
+col_a, col_b = st.columns(2)
+with col_a:
+    fecha_inicio = st.date_input("Fecha de Inicio de Producción", datetime.now())
+with col_b:
+    hora_inicio = st.time_input("Hora de Inicio", datetime.strptime("22:00", "%H:%M").time())
 
-    # 3. Generar Programa
-    if st.button("Generar Programa de Turnos"):
-        df_resultado = generar_calendario_turnos(fecha_inicio, cantidad_kg)
+# Gestión de Productos (Dinámica)
+st.subheader("Lista de Productos a Producir")
+if 'productos' not in st.session_state:
+    st.session_state.productos = []
+
+with st.form("form_prod"):
+    c1, c2, c3 = st.columns(3)
+    p_nombre = c1.text_input("Producto")
+    p_ton = c2.number_input("Tonelaje (kg)", step=500)
+    p_cap = c3.number_input("Capacidad Planta (kg/h)", value=500)
+    if st.form_submit_button("Añadir a la cola"):
+        st.session_state.productos.append({"nombre": p_nombre, "tonelaje": p_ton, "capacidad": p_cap})
+
+if st.session_state.productos:
+    st.write("Cola de producción actual:")
+    st.table(st.session_state.productos)
+    
+    if st.button("GENERAR PROGRAMA COMPLETO"):
+        res = generar_programa_detallado(fecha_inicio, hora_inicio, st.session_state.productos, tiempo_cambio, dias_libres, None)
+        st.dataframe(res, use_container_width=True)
         
-        st.subheader(f"Calendario de Producción - Lote: {cantidad_kg} kg")
-        st.dataframe(df_resultado, use_container_width=True)
-        
-        # Opción para descargar
-        csv = df_resultado.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            "Descargar Programa (CSV)",
-            csv,
-            "programa_produccion.csv",
-            "text/csv"
-        )
+        if st.button("Limpiar Cola"):
+            st.session_state.productos = []
+            st.rerun()
